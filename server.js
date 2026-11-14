@@ -1,6 +1,8 @@
 const express=require("express");
 const session=require("express-session");
 const bcrypt=require("bcryptjs");
+const nodemailer=require("nodemailer");
+const crypto=require("crypto");
 const {Pool}=require("pg");
 const app=express();
 app.set('trust proxy', 1);
@@ -13,7 +15,8 @@ const q=(s,p=[])=>pool.query(s,p);
 async function init(){
  await q(`CREATE TABLE IF NOT EXISTS users(id BIGSERIAL PRIMARY KEY,name VARCHAR(100) NOT NULL,email VARCHAR(180) UNIQUE NOT NULL,password_hash TEXT NOT NULL,created_at TIMESTAMPTZ DEFAULT NOW());
  CREATE TABLE IF NOT EXISTS products(id BIGSERIAL PRIMARY KEY,name VARCHAR(140) NOT NULL,description TEXT DEFAULT '',price NUMERIC(10,2) NOT NULL,image TEXT DEFAULT '',category VARCHAR(80) DEFAULT 'General',stock INT DEFAULT 20,active BOOLEAN DEFAULT TRUE,created_at TIMESTAMPTZ DEFAULT NOW());
- CREATE TABLE IF NOT EXISTS orders(id BIGSERIAL PRIMARY KEY,user_id BIGINT REFERENCES users(id),customer_name VARCHAR(100),phone VARCHAR(30),address TEXT,status VARCHAR(30) DEFAULT 'Placed',total NUMERIC(10,2),items JSONB,created_at TIMESTAMPTZ DEFAULT NOW());`);
+ CREATE TABLE IF NOT EXISTS orders(id BIGSERIAL PRIMARY KEY,user_id BIGINT REFERENCES users(id),customer_name VARCHAR(100),phone VARCHAR(30),address TEXT,status VARCHAR(30) DEFAULT 'Placed',total NUMERIC(10,2),items JSONB,created_at TIMESTAMPTZ DEFAULT NOW());
+ CREATE TABLE IF NOT EXISTS password_resets(id BIGSERIAL PRIMARY KEY,email VARCHAR(180) NOT NULL,otp_hash TEXT NOT NULL,expires_at TIMESTAMPTZ NOT NULL,created_at TIMESTAMPTZ DEFAULT NOW());`);
  const c=await q("SELECT COUNT(*)::int AS n FROM products");
  if(c.rows[0].n===0){
   const sample=[
@@ -32,8 +35,42 @@ function admin(req,res,next){if(!req.session.isAdmin)return res.status(401).json
 app.get("/api/products",async(req,res)=>{const r=await q("SELECT id,name,description,price,image,category,stock FROM products WHERE active=true ORDER BY id DESC");res.json(r.rows)});
 app.post("/api/register",async(req,res)=>{try{const name=String(req.body.name||"").trim(),email=String(req.body.email||"").trim().toLowerCase(),password=String(req.body.password||"");if(name.length<2||name.length>100)return res.status(400).json({error:"Name 2–100 characters ka hona chahiye."});if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return res.status(400).json({error:"Valid email daalein."});if(password.length<8)return res.status(400).json({error:"Password kam se kam 8 characters ka hona chahiye."});const hash=await bcrypt.hash(password,12);const r=await q("INSERT INTO users(name,email,password_hash) VALUES($1,$2,$3) RETURNING id,name,email",[name,email,hash]);req.session.userId=r.rows[0].id;res.json({ok:true,user:r.rows[0]})}catch(e){if(e.code==="23505")return res.status(409).json({error:"Email already registered."});console.error(e);res.status(500).json({error:"Server error."})}});
 app.post("/api/login",async(req,res)=>{const email=String(req.body.email||"").trim().toLowerCase(),password=String(req.body.password||"");const r=await q("SELECT id,name,password_hash FROM users WHERE email=$1",[email]);const u=r.rows[0];if(!u||!await bcrypt.compare(password,u.password_hash))return res.status(401).json({error:"Email ya password galat hai."});req.session.userId=u.id;res.json({ok:true,name:u.name})});
+
+const mailer = process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS
+ ? nodemailer.createTransport({host:process.env.SMTP_HOST,port:Number(process.env.SMTP_PORT||587),secure:String(process.env.SMTP_SECURE||"false")==="true",auth:{user:process.env.SMTP_USER,pass:process.env.SMTP_PASS}})
+ : null;
+app.post("/api/forgot-password",async(req,res)=>{
+ const email=String(req.body.email||"").trim().toLowerCase();
+ if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return res.status(400).json({error:"Valid email address daalein."});
+ if(!mailer)return res.status(503).json({error:"Password reset email service abhi setup nahi hai. SMTP settings configure karni hongi."});
+ try{
+  const user=await q("SELECT id FROM users WHERE email=$1",[email]);
+  if(user.rows.length){
+   const otp=String(crypto.randomInt(100000,1000000)),hash=await bcrypt.hash(otp,10);
+   await q("DELETE FROM password_resets WHERE email=$1",[email]);
+   await q("INSERT INTO password_resets(email,otp_hash,expires_at) VALUES($1,$2,NOW()+INTERVAL '10 minutes')",[email,hash]);
+   await mailer.sendMail({from:process.env.MAIL_FROM||process.env.SMTP_USER,to:email,subject:"ShopEase password reset code",text:`Your ShopEase password reset code is ${otp}. It expires in 10 minutes. If you did not request this, ignore this email.`});
+  }
+  res.json({ok:true,message:"Agar is email se account registered hai, reset code email par bhej diya gaya hai."});
+ }catch(e){console.error("Forgot password email error:",e);res.status(500).json({error:"Email bhejne mein dikkat aayi. Thodi der baad try karein."})}
+});
+app.post("/api/reset-password",async(req,res)=>{
+ const email=String(req.body.email||"").trim().toLowerCase(),otp=String(req.body.otp||"").trim(),password=String(req.body.password||"");
+ if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||!/^\d{6}$/.test(otp))return res.status(400).json({error:"Email aur 6-digit code check karein."});
+ if(password.length<8)return res.status(400).json({error:"Naya password kam se kam 8 characters ka hona chahiye."});
+ try{
+  const r=await q("SELECT id,otp_hash FROM password_resets WHERE email=$1 AND expires_at>NOW() ORDER BY created_at DESC LIMIT 1",[email]);
+  if(!r.rows[0]||!await bcrypt.compare(otp,r.rows[0].otp_hash))return res.status(400).json({error:"Reset code galat ya expire ho gaya hai."});
+  const hash=await bcrypt.hash(password,12);
+  await q("UPDATE users SET password_hash=$1 WHERE email=$2",[hash,email]);
+  await q("DELETE FROM password_resets WHERE email=$1",[email]);
+  res.json({ok:true,message:"Password reset ho gaya. Ab naye password se login karein."});
+ }catch(e){console.error(e);res.status(500).json({error:"Password reset nahi ho paaya."})}
+});
+
 app.post("/api/logout",(req,res)=>req.session.destroy(()=>res.json({ok:true})));
 app.get("/api/me",auth,async(req,res)=>{const r=await q("SELECT id,name,email FROM users WHERE id=$1",[req.session.userId]);res.json(r.rows[0]||null)});
+app.get("/api/my-orders",auth,async(req,res)=>{const r=await q("SELECT id,customer_name,phone,address,total,status,items,created_at FROM orders WHERE user_id=$1 ORDER BY created_at DESC",[req.session.userId]);res.json({orders:r.rows})});
 app.post("/api/orders",auth,async(req,res)=>{const {items,name,phone,address}=req.body;if(!Array.isArray(items)||!items.length||items.length>30)return res.status(400).json({error:"Cart empty hai."});if(!name||!phone||!address)return res.status(400).json({error:"Delivery details complete karein."});const ids=items.map(x=>Number(x.id));if(ids.some(x=>!Number.isInteger(x)||x<1))return res.status(400).json({error:"Invalid cart."});const client=await pool.connect();try{await client.query("BEGIN");let final=[],total=0;for(const it of items){const r=await client.query("SELECT id,name,price,stock FROM products WHERE id=$1 AND active=true FOR UPDATE",[Number(it.id)]);const p=r.rows[0],qty=Math.max(1,Math.min(20,Number(it.qty)||1));if(!p||p.stock<qty)throw new Error("Product stock available nahi hai.");final.push({id:p.id,name:p.name,price:Number(p.price),qty});total+=Number(p.price)*qty;await client.query("UPDATE products SET stock=stock-$1 WHERE id=$2",[qty,p.id]);}const o=await client.query("INSERT INTO orders(user_id,customer_name,phone,address,total,items) VALUES($1,$2,$3,$4,$5,$6) RETURNING id",[req.session.userId,name,phone,address,total,JSON.stringify(final)]);await client.query("COMMIT");res.json({ok:true,orderId:o.rows[0].id,total})}catch(e){await client.query("ROLLBACK");res.status(400).json({error:e.message||"Order place nahi hua."})}finally{client.release()}});
 app.post("/api/admin/login",(req,res)=>{if(req.body.username===process.env.ADMIN_USERNAME&&req.body.password===process.env.ADMIN_PASSWORD&&process.env.ADMIN_PASSWORD){req.session.isAdmin=true;return res.json({ok:true})}res.status(401).json({error:"Admin details galat hain."})});
 app.get("/api/admin/data",admin,async(req,res)=>{const [u,o,p]=await Promise.all([q("SELECT id,name,email,created_at FROM users ORDER BY id DESC LIMIT 200"),q("SELECT id,customer_name,phone,address,total,status,items,created_at FROM orders ORDER BY id DESC LIMIT 200"),q("SELECT id,name,price,stock,active FROM products ORDER BY id DESC")]);res.json({users:u.rows,orders:o.rows,products:p.rows})});
