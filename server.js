@@ -3,6 +3,7 @@ const session=require("express-session");
 const bcrypt=require("bcryptjs");
 const {Pool}=require("pg");
 const app=express();
+app.set('trust proxy', 1);
 const pool=new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.DATABASE_URL?.includes("localhost")?false:{rejectUnauthorized:false}});
 app.use(express.json());
 app.use(express.urlencoded({extended:true}));
