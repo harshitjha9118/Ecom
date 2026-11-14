@@ -1,7 +1,7 @@
 const express=require("express");
 const session=require("express-session");
 const bcrypt=require("bcryptjs");
-const nodemailer=require("nodemailer");
+const { Resend } = require("resend");
 const crypto=require("crypto");
 const {Pool}=require("pg");
 const app=express();
@@ -36,20 +36,25 @@ app.get("/api/products",async(req,res)=>{const r=await q("SELECT id,name,descrip
 app.post("/api/register",async(req,res)=>{try{const name=String(req.body.name||"").trim(),email=String(req.body.email||"").trim().toLowerCase(),password=String(req.body.password||"");if(name.length<2||name.length>100)return res.status(400).json({error:"Name 2–100 characters ka hona chahiye."});if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return res.status(400).json({error:"Valid email daalein."});if(password.length<8)return res.status(400).json({error:"Password kam se kam 8 characters ka hona chahiye."});const hash=await bcrypt.hash(password,12);const r=await q("INSERT INTO users(name,email,password_hash) VALUES($1,$2,$3) RETURNING id,name,email",[name,email,hash]);req.session.userId=r.rows[0].id;res.json({ok:true,user:r.rows[0]})}catch(e){if(e.code==="23505")return res.status(409).json({error:"Email already registered."});console.error(e);res.status(500).json({error:"Server error."})}});
 app.post("/api/login",async(req,res)=>{const email=String(req.body.email||"").trim().toLowerCase(),password=String(req.body.password||"");const r=await q("SELECT id,name,password_hash FROM users WHERE email=$1",[email]);const u=r.rows[0];if(!u||!await bcrypt.compare(password,u.password_hash))return res.status(401).json({error:"Email ya password galat hai."});req.session.userId=u.id;res.json({ok:true,name:u.name})});
 
-const mailer = process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS
- ? nodemailer.createTransport({host:process.env.SMTP_HOST,port:Number(process.env.SMTP_PORT||587),secure:String(process.env.SMTP_SECURE||"false")==="true",auth:{user:process.env.SMTP_USER,pass:process.env.SMTP_PASS}})
- : null;
+const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 app.post("/api/forgot-password",async(req,res)=>{
  const email=String(req.body.email||"").trim().toLowerCase();
  if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return res.status(400).json({error:"Valid email address daalein."});
- if(!mailer)return res.status(503).json({error:"Password reset email service abhi setup nahi hai. SMTP settings configure karni hongi."});
+ if(!resend)return res.status(503).json({error:"RESEND_API_KEY Render Environment mein set nahi hai."});
  try{
   const user=await q("SELECT id FROM users WHERE email=$1",[email]);
   if(user.rows.length){
    const otp=String(crypto.randomInt(100000,1000000)),hash=await bcrypt.hash(otp,10);
    await q("DELETE FROM password_resets WHERE email=$1",[email]);
    await q("INSERT INTO password_resets(email,otp_hash,expires_at) VALUES($1,$2,NOW()+INTERVAL '10 minutes')",[email,hash]);
-   await mailer.sendMail({from:process.env.MAIL_FROM||process.env.SMTP_USER,to:email,subject:"ShopEase password reset code",text:`Your ShopEase password reset code is ${otp}. It expires in 10 minutes. If you did not request this, ignore this email.`});
+   const { data, error } = await resend.emails.send({
+    from: process.env.MAIL_FROM || "ShopEase <onboarding@resend.dev>",
+    to: [email],
+    subject: "ShopEase password reset code",
+    text: `Your ShopEase password reset code is ${otp}. It expires in 10 minutes. If you did not request this, ignore this email.`
+   });
+   if (error) { console.error("Resend API error:", error); return res.status(502).json({error:"Resend email error: "+(error.message||"Request rejected")}); }
+   console.log("Password reset email accepted by Resend:", data?.id);
   }
   res.json({ok:true,message:"Agar is email se account registered hai, reset code email par bhej diya gaya hai."});
  }catch(e){console.error("Forgot password email error:",e);res.status(500).json({error:"Email bhejne mein dikkat aayi. Thodi der baad try karein."})}
