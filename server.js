@@ -21,7 +21,11 @@ async function init(){
  ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_request_note TEXT DEFAULT '';
  ALTER TABLE orders ADD COLUMN IF NOT EXISTS request_status VARCHAR(30) DEFAULT NULL;
  ALTER TABLE orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
- ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ DEFAULT NULL;`);
+ ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ DEFAULT NULL;
+ ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_id VARCHAR(100) DEFAULT NULL;
+ ALTER TABLE orders ADD COLUMN IF NOT EXISTS razorpay_order_id VARCHAR(100) DEFAULT NULL;
+ ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_status VARCHAR(30) DEFAULT 'Pending';
+ CREATE TABLE IF NOT EXISTS payment_attempts(razorpay_order_id VARCHAR(100) PRIMARY KEY,user_id BIGINT REFERENCES users(id),items JSONB NOT NULL,total NUMERIC(10,2) NOT NULL,created_at TIMESTAMPTZ DEFAULT NOW());`);
  const c=await q("SELECT COUNT(*)::int AS n FROM products");
  if(c.rows[0].n===0){
   const sample=[
@@ -98,11 +102,53 @@ app.post("/api/reset-password",async(req,res)=>{
 app.post("/api/logout",(req,res)=>req.session.destroy(()=>res.json({ok:true})));
 app.get("/api/me",auth,async(req,res)=>{const r=await q("SELECT id,name,email FROM users WHERE id=$1",[req.session.userId]);res.json(r.rows[0]||null)});
 app.patch("/api/profile",auth,async(req,res)=>{try{const name=String(req.body.name||"").trim(),email=String(req.body.email||"").trim().toLowerCase(),currentPassword=String(req.body.currentPassword||"");if(name.length<2||name.length>100)return res.status(400).json({error:"Name 2–100 characters ka hona chahiye."});if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return res.status(400).json({error:"Valid email daalein."});if(!currentPassword)return res.status(400).json({error:"Changes confirm karne ke liye current password daalein."});const u=await q("SELECT password_hash FROM users WHERE id=$1",[req.session.userId]);if(!u.rows[0]||!await bcrypt.compare(currentPassword,u.rows[0].password_hash))return res.status(401).json({error:"Current password galat hai."});const r=await q("UPDATE users SET name=$1,email=$2 WHERE id=$3 RETURNING id,name,email",[name,email,req.session.userId]);res.json({ok:true,user:r.rows[0]})}catch(e){if(e.code==="23505")return res.status(409).json({error:"Ye email kisi aur account par registered hai."});console.error(e);res.status(500).json({error:"Profile update nahi ho paaya."})}});
-app.get("/api/my-orders",auth,async(req,res)=>{const r=await q("SELECT id,customer_name,phone,address,total,status,items,created_at,delivered_at,customer_request,customer_request_note,request_status FROM orders WHERE user_id=$1 ORDER BY created_at DESC",[req.session.userId]);res.json({orders:r.rows})});
+app.get("/api/my-orders",auth,async(req,res)=>{const r=await q("SELECT id,customer_name,phone,address,total,status,items,created_at,delivered_at,customer_request,customer_request_note,request_status,payment_status,payment_id FROM orders WHERE user_id=$1 ORDER BY created_at DESC",[req.session.userId]);res.json({orders:r.rows})});
 app.post("/api/my-orders/:id/request",auth,async(req,res)=>{const type=String(req.body.type||""),note=String(req.body.note||"").trim().slice(0,500);if(!["Cancel","Return"].includes(type))return res.status(400).json({error:"Invalid request."});const r=await q("SELECT id,status,created_at,delivered_at FROM orders WHERE id=$1 AND user_id=$2",[req.params.id,req.session.userId]);const o=r.rows[0];if(!o)return res.status(404).json({error:"Order nahi mila."});if(type==="Cancel"&&! ["Placed","Processing"].includes(o.status))return res.status(400).json({error:"Shipped ya delivered order cancel nahi ho sakta. Return request karein."});if(type==="Return"&&(o.status!=="Delivered"||!o.delivered_at||Date.now()-new Date(o.delivered_at).getTime()>7*86400000))return res.status(400).json({error:"Return sirf delivery ke 7 din ke andar request kar sakte hain."});await q("UPDATE orders SET customer_request=$1,customer_request_note=$2,request_status='Pending',updated_at=NOW() WHERE id=$3",[type,note,o.id]);res.json({ok:true,message:type+" request submit ho gayi."})});
-app.post("/api/orders",auth,async(req,res)=>{const {items,name,phone,address}=req.body;if(!Array.isArray(items)||!items.length||items.length>30)return res.status(400).json({error:"Cart empty hai."});if(!name||!phone||!address)return res.status(400).json({error:"Delivery details complete karein."});const ids=items.map(x=>Number(x.id));if(ids.some(x=>!Number.isInteger(x)||x<1))return res.status(400).json({error:"Invalid cart."});const client=await pool.connect();try{await client.query("BEGIN");let final=[],total=0;for(const it of items){const r=await client.query("SELECT id,name,price,stock FROM products WHERE id=$1 AND active=true FOR UPDATE",[Number(it.id)]);const p=r.rows[0],qty=Math.max(1,Math.min(20,Number(it.qty)||1));if(!p||p.stock<qty)throw new Error("Product stock available nahi hai.");final.push({id:p.id,name:p.name,price:Number(p.price),qty});total+=Number(p.price)*qty;await client.query("UPDATE products SET stock=stock-$1 WHERE id=$2",[qty,p.id]);}const o=await client.query("INSERT INTO orders(user_id,customer_name,phone,address,total,items) VALUES($1,$2,$3,$4,$5,$6) RETURNING id",[req.session.userId,name,phone,address,total,JSON.stringify(final)]);await client.query("COMMIT");res.json({ok:true,orderId:o.rows[0].id,total})}catch(e){await client.query("ROLLBACK");res.status(400).json({error:e.message||"Order place nahi hua."})}finally{client.release()}});
+// Razorpay live checkout: secrets remain server-side in Render Environment.
+async function getCartTotal(items, client=pool){
+ if(!Array.isArray(items)||!items.length||items.length>30) throw new Error("Cart empty hai.");
+ const final=[];let total=0;
+ for(const it of items){
+  const id=Number(it.id),qty=Math.max(1,Math.min(20,Number(it.qty)||1));
+  if(!Number.isInteger(id)||id<1) throw new Error("Invalid cart.");
+  const r=await client.query("SELECT id,name,price,stock FROM products WHERE id=$1 AND active=true",[id]);
+  const p=r.rows[0];if(!p||p.stock<qty)throw new Error("Product stock available nahi hai.");
+  final.push({id:p.id,name:p.name,price:Number(p.price),qty});total+=Number(p.price)*qty;
+ }
+ return {final,total};
+}
+app.post("/api/payment/create-order",auth,async(req,res)=>{
+ try{
+  if(!process.env.RAZORPAY_KEY_ID||!process.env.RAZORPAY_KEY_SECRET)return res.status(503).json({error:"Razorpay Live keys Render par set nahi hain."});
+  const {final,total}=await getCartTotal(req.body.items);
+  const rr=await fetch("https://api.razorpay.com/v1/orders",{method:"POST",headers:{"Authorization":"Basic "+Buffer.from(process.env.RAZORPAY_KEY_ID+":"+process.env.RAZORPAY_KEY_SECRET).toString("base64"),"Content-Type":"application/json"},body:JSON.stringify({amount:Math.round(total*100),currency:"INR",receipt:"shop_"+Date.now(),notes:{user_id:String(req.session.userId)}})});
+  const data=await rr.json();if(!rr.ok){console.error("Razorpay order error",data);return res.status(502).json({error:"Razorpay order create nahi hua. Dashboard aur keys check karein."});}
+  await q("INSERT INTO payment_attempts(razorpay_order_id,user_id,items,total) VALUES($1,$2,$3,$4)",[data.id,req.session.userId,JSON.stringify(final),total]);
+  res.json({ok:true,razorpayOrderId:data.id,amount:data.amount,currency:data.currency,keyId:process.env.RAZORPAY_KEY_ID});
+ }catch(e){res.status(400).json({error:e.message||"Payment start nahi ho paya."})}
+});
+app.post("/api/payment/verify",auth,async(req,res)=>{
+ const {razorpay_order_id,razorpay_payment_id,razorpay_signature,items,name,phone,address}=req.body;
+ if(!razorpay_order_id||!razorpay_payment_id||!razorpay_signature||!name||!phone||!address)return res.status(400).json({error:"Payment verification details incomplete."});
+ const expected=crypto.createHmac("sha256",process.env.RAZORPAY_KEY_SECRET||"").update(razorpay_order_id+"|"+razorpay_payment_id).digest("hex");
+ const a=Buffer.from(expected),b=Buffer.from(String(razorpay_signature));if(a.length!==b.length||!crypto.timingSafeEqual(a,b))return res.status(400).json({error:"Payment signature verify nahi hua. Order confirm nahi kiya gaya."});
+ const client=await pool.connect();try{
+  await client.query("BEGIN");
+  const existing=await client.query("SELECT id,total FROM orders WHERE razorpay_order_id=$1 OR payment_id=$2",[razorpay_order_id,razorpay_payment_id]);
+  if(existing.rows[0]){await client.query("COMMIT");return res.json({ok:true,orderId:existing.rows[0].id,total:Number(existing.rows[0].total),alreadyProcessed:true});}
+  const attempt=await client.query("SELECT items,total FROM payment_attempts WHERE razorpay_order_id=$1 AND user_id=$2 FOR UPDATE",[razorpay_order_id,req.session.userId]);
+  if(!attempt.rows[0])throw new Error("Payment order details nahi mile. Support se sampark karein.");
+  const final=attempt.rows[0].items,total=Number(attempt.rows[0].total);
+  const pay=await fetch("https://api.razorpay.com/v1/payments/"+encodeURIComponent(razorpay_payment_id),{headers:{"Authorization":"Basic "+Buffer.from(process.env.RAZORPAY_KEY_ID+":"+process.env.RAZORPAY_KEY_SECRET).toString("base64")}});
+  const pd=await pay.json();if(!pay.ok||pd.order_id!==razorpay_order_id||pd.status!=="captured"||Number(pd.amount)!==Math.round(total*100)||pd.currency!=="INR")throw new Error("Payment captured ya amount verify nahi hua. Order confirm nahi kiya.");
+  for(const it of final){const u=await client.query("UPDATE products SET stock=stock-$1 WHERE id=$2 AND stock >= $1",[it.qty,it.id]);if(!u.rowCount)throw new Error("Stock abhi available nahi hai. Support se sampark karein.");}
+  const o=await client.query("INSERT INTO orders(user_id,customer_name,phone,address,total,items,status,razorpay_order_id,payment_id,payment_status) VALUES($1,$2,$3,$4,$5,$6,'Placed',$7,$8,'Paid') RETURNING id",[req.session.userId,String(name).slice(0,100),String(phone).slice(0,30),String(address).slice(0,1000),total,JSON.stringify(final),razorpay_order_id,razorpay_payment_id]);
+  await client.query("DELETE FROM payment_attempts WHERE razorpay_order_id=$1",[razorpay_order_id]);
+  await client.query("COMMIT");res.json({ok:true,orderId:o.rows[0].id,total});
+ }catch(e){await client.query("ROLLBACK");console.error("Payment verify error",e);res.status(400).json({error:e.message||"Payment verify nahi hua."})}finally{client.release()}
+});
 app.post("/api/admin/login",(req,res)=>{if(req.body.username===process.env.ADMIN_USERNAME&&req.body.password===process.env.ADMIN_PASSWORD&&process.env.ADMIN_PASSWORD){req.session.isAdmin=true;return res.json({ok:true})}res.status(401).json({error:"Admin details galat hain."})});
-app.get("/api/admin/data",admin,async(req,res)=>{const [u,o,p]=await Promise.all([q("SELECT id,name,email,created_at FROM users ORDER BY id DESC LIMIT 200"),q("SELECT id,customer_name,phone,address,total,status,items,created_at,customer_request,customer_request_note,request_status FROM orders ORDER BY id DESC LIMIT 200"),q("SELECT id,name,price,stock,active FROM products ORDER BY id DESC")]);res.json({users:u.rows,orders:o.rows,products:p.rows})});
+app.get("/api/admin/data",admin,async(req,res)=>{const [u,o,p]=await Promise.all([q("SELECT id,name,email,created_at FROM users ORDER BY id DESC LIMIT 200"),q("SELECT id,customer_name,phone,address,total,status,items,created_at,customer_request,customer_request_note,request_status,payment_status,payment_id FROM orders ORDER BY id DESC LIMIT 200"),q("SELECT id,name,price,stock,active FROM products ORDER BY id DESC")]);res.json({users:u.rows,orders:o.rows,products:p.rows})});
 app.post("/api/admin/products",admin,async(req,res)=>{const {name,description,price,image,category,stock}=req.body;if(!name||!Number.isFinite(Number(price))||Number(price)<=0)return res.status(400).json({error:"Product name aur valid price required."});const r=await q("INSERT INTO products(name,description,price,image,category,stock) VALUES($1,$2,$3,$4,$5,$6) RETURNING id",[name,description||"",price,image||"",category||"General",Math.max(0,Number(stock)||0)]);res.json({ok:true,id:r.rows[0].id})});
 app.patch("/api/admin/orders/:id",admin,async(req,res)=>{const status=String(req.body.status||"");if(!["Placed","Processing","Shipped","Delivered","Cancelled","Return Approved","Return Rejected"].includes(status))return res.status(400).json({error:"Invalid status."});await q("UPDATE orders SET status=$1,delivered_at=CASE WHEN $1='Delivered' THEN COALESCE(delivered_at,NOW()) ELSE delivered_at END,request_status=CASE WHEN $1 IN ('Cancelled','Return Approved','Return Rejected') THEN $1 ELSE request_status END,updated_at=NOW() WHERE id=$2",[status,req.params.id]);res.json({ok:true})});
 app.listen(process.env.PORT||3000,()=>console.log("ShopEase running"));
